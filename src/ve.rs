@@ -49,6 +49,10 @@ pub(crate) fn handle_io(trapframe: &mut dyn TdxTrapFrame, ve_info: &TdgVeInfo) -
     };
     let port = (ve_info.exit_qualification >> 16) as u16;
 
+    if !is_port_allowed(port) {
+        return false;
+    }
+
     match direction {
         Direction::In => {
             trapframe.set_rax(io_read(size, port).unwrap() as usize);
@@ -416,3 +420,15 @@ fn decode_mmio(instr: &Instruction) -> Option<(InstrMmioType, IoSize)> {
         _ => None,
     }
 }
+
+fn is_port_allowed(port: u16) -> bool {
+    ALLOWED_IO_PORTS.iter().any(|(start, end, _)| {
+        port >= *start && port <= *end
+    })
+}
+
+const ALLOWED_IO_PORTS: &[(u16, u16, &str)] = &[
+    (0x70, 0x71, "MC146818 RTC"),
+    (0xcf8, 0xcff, "PCI config space"),
+    (0x600, 0x62f, "ACPI ports"),
+];
