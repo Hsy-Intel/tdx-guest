@@ -76,7 +76,7 @@ pub struct TdgVpInfo {
     pub num_vcpus: u32,
     pub max_vcpus: u32,
     pub vcpu_index: u32,
-    /// Indicates that the TDG.SYS.RD/RDM/RDCALL function are avaliable.
+    /// Indicates that the TDG.SYS.RD/RDM/RDCALL function are available.
     pub sys_rd: u32,
 }
 
@@ -218,7 +218,7 @@ pub fn write_page_attr(page_attr: PageAttr, attr_flags: u64) -> Result<PageAttr,
 /// TDG.MR.REPORT creates a TDREPORT_STRUCT structure that contains the measurements/configuration
 /// information of the guest TD that called the function, measurements/configuration information
 /// of the Intel TDX module and a REPORTMACSTRUCT.
-/// 
+///
 /// # Safety
 ///
 /// The caller must ensure that:
@@ -391,9 +391,7 @@ pub fn assign_svn() {
 }
 
 /// Get a persistent key, customized to the TD’s measurements and policy.
-pub fn get_sealing_key() {
-
-}
+pub fn get_sealing_key() {}
 
 /// As a service TD, read a metadata field (control structure field) of a target TD.
 ///

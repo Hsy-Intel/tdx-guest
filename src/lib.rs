@@ -21,7 +21,7 @@ use ve::{handle_io, handle_mmio};
 
 pub use self::{
     tdcall::{get_veinfo, TdgVeInfo, TdxVirtualExceptionType},
-    tdvmcall::{cpuid, hlt, print, rdmsr, wrmsr},
+    tdvmcall::{cpuid, hlt, print, rdmsr, wrmsr, TDX_LOGGER},
 };
 
 #[derive(Debug)]
@@ -125,7 +125,7 @@ pub fn handle_virtual_exception(trapframe: &mut dyn TdxTrapFrame, ve_info: &TdgV
             instr_len = handle_mmio(trapframe, ve_info).unwrap() as u32;
         }
         TdxVirtualExceptionType::Other => {
-            serial_println!("Unknown TDX vitrual exception type");
+            serial_println!("Unknown TDX virtual exception type");
             hlt();
         }
         _ => return,

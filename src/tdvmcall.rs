@@ -11,8 +11,15 @@ extern crate alloc;
 
 use alloc::fmt;
 use core::fmt::Write;
+
+use log::{Log, Metadata, Record};
 use x86_64::registers::rflags::{self, RFlags};
+
 use crate::asm::asm_td_vmcall;
+
+pub struct TdxLogger;
+
+pub static TDX_LOGGER: TdxLogger = TdxLogger;
 
 #[derive(Debug, PartialEq)]
 pub enum TdVmcallError {
@@ -371,4 +378,36 @@ impl From<u64> for TdVmcallError {
             _ => Self::Other,
         }
     }
+}
+
+impl Log for TdxLogger {
+    fn enabled(&self, metadata: &Metadata) -> bool {
+        true
+    }
+
+    fn log(&self, record: &Record) {
+        let level = record.level();
+        let _ = write_serial_safe(format_args!("{}: {}\n", level, record.args()));
+    }
+
+    fn flush(&self) {}
+}
+
+fn write_serial_safe(args: core::fmt::Arguments) -> bool {
+    use core::fmt::Write;
+
+    struct SafeSerial;
+
+    impl Write for SafeSerial {
+        fn write_str(&mut self, s: &str) -> core::fmt::Result {
+            for &byte in s.as_bytes() {
+                if io_write!(SERIAL_IO_PORT, byte, u8).is_err() {
+                    return Err(core::fmt::Error);
+                }
+            }
+            Ok(())
+        }
+    }
+
+    SafeSerial.write_fmt(args).is_ok()
 }
