@@ -230,7 +230,7 @@ pub fn write_page_attr(page_attr: PageAttr, attr_flags: u64) -> Result<PageAttr,
 /// - The memory regions are accessible and not shared with untrusted code
 /// - The buffers remain valid and unmodified during the entire call
 /// - The caller has appropriate privileges to perform this operation
-pub unsafe fn get_report(report_gpa: u64, data_gpa: u64) -> Result<(), TdCallError> {
+pub fn get_report(report_gpa: u64, data_gpa: u64) -> Result<(), TdCallError> {
     let mut args = TdcallArgs {
         rax: TdcallNum::MrReport as u64,
         rcx: report_gpa,
