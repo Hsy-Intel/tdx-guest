@@ -47,7 +47,7 @@ The tdx-guest provides a Rust implementation of Intel® Trust Domain Extension
 | 0x10000             | GetTdVmCallInfo                    | ✅             | `get_tdvmcall_info`               | 1.0, 1.5   |
 | 0x10001             | MapGPA                             | ✅             | `map_gpa`                         | 1.0, 1.5   |
 | 0x10002             | GetQuote                           | ✅             | `get_quote`                       | 1.0, 1.5   |
-| 0x10003             | ReportFatalError                   | ❌             | -                                 | 1.0, 1.5   |
+| 0x10003             | ReportFatalError                   | ✅             | `report_fatal_error`                                 | 1.0, 1.5   |
 | 0x10004             | SetupEventNotifyInterrupt          | ✅             | `setup_event_notify_interrupt`    | 1.0, 1.5   |
 | 0x10005             | Service                            | ✅             | `get_td_service`                  | 1.5        |
 
@@ -61,4 +61,4 @@ The tdx-guest provides a Rust implementation of Intel® Trust Domain Extension
 | 32                            | Instruction.WRMSR                  | ✅             | `wrmsr`                           | 1.0, 1.5    |
 | 48                            | #VE.RequestMMIO                    | ✅             | `read_mmio`, `write_mmio`         | 1.0, 1.5    |
 | 54                            | Instruction.WBINVD                 | ✅             | `perform_cache_operation`         | 1.0, 1.5    |
-| 65                            | Instruction.PCONFIG                | ❌             | -                                 | 1.0, 1.5    |
+| 65                            | Instruction.PCONFIG                | ✅             | `pconfig`                                 | 1.0, 1.5    |

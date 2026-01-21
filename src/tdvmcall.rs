@@ -368,6 +368,22 @@ pub fn report_fatal_error(shared_gpa: Option<u64>, msg: Option<&str>) -> ! {
     }
 }
 
+pub fn pconfig(leaf: u64, r13: u64, r14: u64, r15: u64) -> Result<u64, TdVmcallError> {
+    let mut args = TdVmcallArgs {
+        r11: TdVmcallNum::PConfig as u64,
+        r12: leaf,
+        r13,
+        r14,
+        r15,
+        rcx: 0,
+        ..Default::default()
+    };
+
+    td_vmcall(&mut args)?;
+
+    Ok(args.r11)
+}
+
 pub fn print(args: fmt::Arguments) {
     Serial
         .write_fmt(args)
@@ -398,6 +414,7 @@ pub enum TdVmcallNum {
     Wrmsr = 0x00020,
     RequestMmio = 0x00030,
     Wbinvd = 0x00036,
+    PConfig = 0x00041,
     GetTdVmcallInfo = 0x10000,
     Mapgpa = 0x10001,
     GetQuote = 0x10002,
