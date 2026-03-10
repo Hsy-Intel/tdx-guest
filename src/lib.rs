@@ -44,6 +44,9 @@ pub enum SeptVeError {
 pub enum AcceptError {
     TdCall(TdCallError),
     InvalidAlignment,
+    OutOfBounds,
+    Overlap,
+    ArithmeticOverflow,
 }
 
 pub type TdxGpa = usize;
@@ -449,6 +452,15 @@ fn try_accept_one(
     match unsafe { accept_page(page_level as u64, start) } {
         Ok(_) => Ok(TryAcceptResult::Accepted(size)),
         Err(e) => match e {
+            // PageAlreadyAccepted: If 4K, it is fully accepted. If larger, earlier stages
+            // might have accepted only a subregion (e.g. 4K out of 2M), so we must split.
+            TdCallError::TdxPageAlreadyAccepted => {
+                if page_level == PageLevel::L1_4K {
+                    Ok(TryAcceptResult::Accepted(size))
+                } else {
+                    Ok(TryAcceptResult::SizeMismatch)
+                }
+            }
             // PageSizeMismatch: VMM mapped it differently.
             // OperandInvalid: Hardware doesn't support this size or address is rejected.
             TdCallError::TdxPageSizeMismatch | TdCallError::TdxOperandInvalid => {
