@@ -2,9 +2,17 @@
 // Copyright(c) 2026 Intel Corporation.
 
 //! Support for unaccepted memory in TDX guest environments.
-//! This module provides mechanisms to manage and accept unaccepted memory regions in TDX guests.
-//! The core data structure is `EfiUnacceptedMemory`, which represents the EFI table header and provides
-//! methods to manipulate the unaccepted memory bitmap and perform acceptance operations.
+//!
+//! This module provides mechanisms to manage and accept
+//! unaccepted memory regions in TDX guests.
+//! The core data structure is [`EfiUnacceptedMemory`],
+//! which represents the EFI table header
+//! and provides methods to manipulate the unaccepted memory bitmap
+//! and perform acceptance operations.
+
+mod bitmap;
+
+use bitmap::{BitIndex, BitmapMut, BitmapOps, BitmapRef, UnsyncBitmapMut};
 
 use crate::{accept_memory, AcceptError};
 
@@ -94,16 +102,35 @@ impl EfiUnacceptedMemory {
     }
 
     /// Returns whether `(start, size)` overlaps any pending bitmap unit.
-    pub fn is_range_pending_by_size(&self, start: u64, size: u64) -> Result<bool, AcceptError> {
+    ///
+    /// # Safety
+    ///
+    /// The caller must ensure:
+    /// - This header is followed by at least `self.bitmap_size_bytes` readable bytes
+    ///   (i.e., the trailing bitmap payload exists in valid memory).
+    /// - No concurrent mutation of overlapping bitmap bytes is in progress.
+    pub unsafe fn is_range_pending_by_size(
+        &self,
+        start: u64,
+        size: u64,
+    ) -> Result<bool, AcceptError> {
         let Some(end) = start.checked_add(size) else {
             return Err(AcceptError::ArithmeticOverflow);
         };
 
-        self.is_range_pending(start, end)
+        // SAFETY: Caller guarantees trailing bitmap validity and no concurrent mutation.
+        unsafe { self.is_range_pending(start, end) }
     }
 
     /// Returns whether `[start, end)` overlaps any pending bitmap unit.
-    pub fn is_range_pending(&self, start: u64, end: u64) -> Result<bool, AcceptError> {
+    ///
+    /// # Safety
+    ///
+    /// The caller must ensure:
+    /// - This header is followed by at least `self.bitmap_size_bytes` readable bytes
+    ///   (i.e., the trailing bitmap payload exists in valid memory).
+    /// - No concurrent mutation of overlapping bitmap bytes is in progress.
+    pub unsafe fn is_range_pending(&self, start: u64, end: u64) -> Result<bool, AcceptError> {
         let Some((range_start, range_end, unit_size)) =
             self.clamp_gpa_range_to_bitmap_coverage(start, end)?
         else {
@@ -111,8 +138,8 @@ impl EfiUnacceptedMemory {
         };
 
         let (first_bit, last_bit) = self.addr_to_bit_range(range_start, range_end, unit_size)?;
-        // SAFETY: caller of this safe API only reads immutable table state.
-        let bitmap = unsafe { self.as_bitmap_slice() };
+        // SAFETY: Caller guarantees trailing bitmap is valid and readable.
+        let bitmap = unsafe { self.as_bitmap_slice()? };
         BitmapRef::new(bitmap).has_set_bit(first_bit, last_bit)
     }
 
@@ -120,8 +147,16 @@ impl EfiUnacceptedMemory {
     ///
     /// Ranges outside bitmap coverage are considered accepted by definition,
     /// because this table only tracks deferred acceptance inside its own coverage.
-    pub fn is_fully_accepted(&self, start: u64, end: u64) -> Result<bool, AcceptError> {
-        Ok(!self.is_range_pending(start, end)?)
+    ///
+    /// # Safety
+    ///
+    /// The caller must ensure:
+    /// - This header is followed by at least `self.bitmap_size_bytes` readable bytes
+    ///   (i.e., the trailing bitmap payload exists in valid memory).
+    /// - No concurrent mutation of overlapping bitmap bytes is in progress.
+    pub unsafe fn is_fully_accepted(&self, start: u64, end: u64) -> Result<bool, AcceptError> {
+        // SAFETY: Caller guarantees trailing bitmap validity and no concurrent mutation.
+        Ok(!unsafe { self.is_range_pending(start, end) }?)
     }
 
     /// Convenience wrapper for
@@ -176,6 +211,172 @@ impl EfiUnacceptedMemory {
         Ok(())
     }
 
+    /// Accepts bitmap-marked units that overlap `start..end`
+    /// and clears the corresponding bitmap bits.
+    ///
+    /// Unlike [`Self::accept_range`], this method takes `&self`,
+    /// enabling concurrent accept operations on **non-overlapping** bitmap regions
+    /// from different CPUs.
+    /// The caller must ensure that no two concurrent calls
+    /// operate on the same bitmap byte range.
+    ///
+    /// # Safety
+    ///
+    /// The caller must ensure:
+    /// - This table and bitmap describe pending private-memory units.
+    /// - The target GPA range is valid for TDX acceptance.
+    /// - No concurrent call touches the same bitmap bits (e.g., by holding a shard lock
+    ///   that covers the target range).
+    pub unsafe fn accept_range_concurrent(&self, start: u64, end: u64) -> Result<(), AcceptError> {
+        if start >= end {
+            return Ok(());
+        }
+
+        let (range_start, range_end, unit_size) =
+            match self.clamp_gpa_range_to_bitmap_coverage(start, end)? {
+                Some(vals) => vals,
+                None => return Ok(()),
+            };
+
+        let (first_bit, last_bit) = self.addr_to_bit_range(range_start, range_end, unit_size)?;
+        let phys_base = PhysAddr::new(self.phys_base);
+
+        let bit_to_gpa_fn = |bit: BitIndex| -> Result<u64, AcceptError> {
+            Ok(phys_base.checked_add_units(bit, unit_size)?.raw())
+        };
+
+        // SAFETY: Caller guarantees no concurrent access to overlapping bitmap bits;
+        // bitmap_raw_parts_mut returns a valid pointer and length.
+        let (bitmap_ptr, bitmap_len) = unsafe { self.bitmap_raw_parts_mut()? };
+        let mut bitmap = unsafe { UnsyncBitmapMut::new(bitmap_ptr, bitmap_len) };
+
+        let mut scan = first_bit;
+        while let Some(run_start) = bitmap.find_next_set(scan, last_bit)? {
+            let run_end = bitmap
+                .find_next_zero(run_start, last_bit)?
+                .unwrap_or(last_bit);
+
+            let run_gpa_start = bit_to_gpa_fn(run_start)?;
+            let run_gpa_end = bit_to_gpa_fn(run_end)?;
+
+            // SAFETY: Caller guarantees bitmap/GPA validity for pending private pages.
+            unsafe { accept_memory(run_gpa_start, run_gpa_end)? };
+            bitmap.clear_range(run_start, run_end)?;
+            scan = run_end;
+        }
+
+        Ok(())
+    }
+
+    /// Accepts a raw physical memory range via TDX TDCALL without touching
+    /// the bitmap.
+    ///
+    /// This is intended for the second phase of the claim-then-accept pattern:
+    /// after claiming (and clearing) bitmap bits under a shard lock, the caller
+    /// drops the lock and calls this with interrupts enabled.
+    ///
+    /// # Safety
+    ///
+    /// The caller must ensure the GPA range is valid for TDX acceptance and
+    /// that no other CPU is concurrently accepting the same range.
+    pub unsafe fn accept_memory_raw(start: u64, end: u64) -> Result<(), AcceptError> {
+        if start >= end {
+            return Ok(());
+        }
+        // SAFETY: Caller guarantees the physical range is valid for TDX acceptance.
+        unsafe { accept_memory(start, end) }
+    }
+
+    /// Finds the first contiguous run of set bits overlapping `[start, end)`,
+    /// clears those bits, and returns the corresponding GPA range.
+    ///
+    /// This is the "claim" phase of the claim-then-accept pattern: the caller
+    /// acquires a shard lock, calls this to atomically identify and clear one
+    /// pending run, releases the lock, then performs the slow TDX accept with
+    /// interrupts enabled.
+    ///
+    /// Returns `Ok(None)` when no pending bits remain in the range.
+    ///
+    /// # Safety
+    ///
+    /// The caller must ensure:
+    /// - This table and bitmap reside in valid, writable memory.
+    /// - No concurrent call touches the same bitmap bits (e.g., shard lock held).
+    pub unsafe fn claim_next_pending_run(
+        &self,
+        start: u64,
+        end: u64,
+    ) -> Result<Option<(u64, u64)>, AcceptError> {
+        if start >= end {
+            return Ok(None);
+        }
+
+        let (range_start, range_end, unit_size) =
+            match self.clamp_gpa_range_to_bitmap_coverage(start, end)? {
+                Some(vals) => vals,
+                None => return Ok(None),
+            };
+
+        let (first_bit, last_bit) = self.addr_to_bit_range(range_start, range_end, unit_size)?;
+        let phys_base = PhysAddr::new(self.phys_base);
+
+        let bit_to_gpa_fn = |bit: BitIndex| -> Result<u64, AcceptError> {
+            Ok(phys_base.checked_add_units(bit, unit_size)?.raw())
+        };
+
+        // SAFETY: Caller guarantees shard-level exclusivity;
+        // bitmap_raw_parts_mut returns a valid pointer and length.
+        let (bitmap_ptr, bitmap_len) = unsafe { self.bitmap_raw_parts_mut()? };
+        let mut bitmap = unsafe { UnsyncBitmapMut::new(bitmap_ptr, bitmap_len) };
+
+        let Some(run_start) = bitmap.find_next_set(first_bit, last_bit)? else {
+            return Ok(None);
+        };
+        let run_end = bitmap
+            .find_next_zero(run_start, last_bit)?
+            .unwrap_or(last_bit);
+
+        bitmap.clear_range(run_start, run_end)?;
+
+        let gpa_start = bit_to_gpa_fn(run_start)?;
+        let gpa_end = bit_to_gpa_fn(run_end)?;
+        Ok(Some((gpa_start, gpa_end)))
+    }
+
+    /// Re-sets bitmap bits for a GPA range whose TDX accept failed.
+    ///
+    /// This is the rollback counterpart of [`Self::claim_next_pending_run`].
+    /// After a claimed run fails to be accepted, the caller re-acquires the
+    /// shard lock and calls this to restore the cleared bits so the range
+    /// remains visible as unaccepted.
+    ///
+    /// # Safety
+    ///
+    /// The caller must ensure:
+    /// - This table and bitmap reside in valid, writable memory.
+    /// - No concurrent call touches the same bitmap bits (e.g., shard lock held).
+    /// - The range was previously claimed (bits cleared) and not yet accepted.
+    pub unsafe fn restore_pending_range(&self, start: u64, end: u64) -> Result<(), AcceptError> {
+        if start >= end {
+            return Ok(());
+        }
+
+        let (range_start, range_end, unit_size) =
+            match self.clamp_gpa_range_to_bitmap_coverage(start, end)? {
+                Some(vals) => vals,
+                None => return Ok(()),
+            };
+
+        let (first_bit, last_bit) = self.addr_to_bit_range(range_start, range_end, unit_size)?;
+
+        // SAFETY: Caller guarantees shard-level exclusivity;
+        // bitmap_raw_parts_mut returns a valid pointer and length.
+        let (bitmap_ptr, bitmap_len) = unsafe { self.bitmap_raw_parts_mut()? };
+        let mut bitmap = unsafe { UnsyncBitmapMut::new(bitmap_ptr, bitmap_len) };
+
+        bitmap.set_range(first_bit, last_bit)
+    }
+
     /// Returns the end GPA (exclusive) covered by the bitmap.
     ///
     /// This is equivalent to `phys_base + total_coverage_size()`.
@@ -189,21 +390,16 @@ impl EfiUnacceptedMemory {
     /// # Safety
     ///
     /// The caller must ensure that this header is followed by at least
-    /// `self.bitmap_size_bytes`
-    /// readable bytes in memory.
-    pub unsafe fn as_bitmap_slice(&self) -> &[u8] {
-        debug_assert!(self.byte_len().is_ok());
+    /// `self.bitmap_size_bytes` readable bytes in memory.
+    pub unsafe fn as_bitmap_slice(&self) -> Result<&[u8], AcceptError> {
+        let bitmap_len = self.byte_len()?;
         let bitmap_ptr = core::ptr::from_ref(self)
             .cast::<u8>()
-            .wrapping_add(core::mem::size_of::<Self>());
-        let bitmap_len = self
-            .byte_len()
-            .expect("bitmap size must fit usize on this platform");
+            .add(core::mem::size_of::<Self>());
         // SAFETY: `bitmap_ptr` points to the trailing bitmap bytes immediately
         // after `self`; `bitmap_len` is validated from `self.bitmap_size_bytes`;
-        // caller guarantees
-        // readable backing memory for the returned slice.
-        unsafe { core::slice::from_raw_parts(bitmap_ptr, bitmap_len) }
+        // caller guarantees readable backing memory for the returned slice.
+        Ok(unsafe { core::slice::from_raw_parts(bitmap_ptr, bitmap_len) })
     }
 
     /// Returns a mutable slice view of the trailing bitmap payload.
@@ -211,23 +407,17 @@ impl EfiUnacceptedMemory {
     /// # Safety
     ///
     /// The caller must ensure that this header is followed by at least
-    /// `self.bitmap_size_bytes`
-    /// writable bytes in memory, and that no aliased mutable reference exists
-    /// while the returned slice is in use.
-    pub unsafe fn as_bitmap_slice_mut(&mut self) -> &mut [u8] {
-        debug_assert!(self.byte_len().is_ok());
+    /// `self.bitmap_size_bytes` writable bytes in memory, and that no aliased
+    /// mutable reference exists while the returned slice is in use.
+    pub unsafe fn as_bitmap_slice_mut(&mut self) -> Result<&mut [u8], AcceptError> {
+        let bitmap_len = self.byte_len()?;
         let bitmap_ptr_mut = core::ptr::from_mut(self)
             .cast::<u8>()
-            .wrapping_add(core::mem::size_of::<Self>());
-        debug_assert!(!bitmap_ptr_mut.is_null());
-        let bitmap_len = self
-            .byte_len()
-            .expect("bitmap size must fit usize on this platform");
+            .add(core::mem::size_of::<Self>());
         // SAFETY: `bitmap_ptr_mut` points to the trailing bitmap bytes immediately
         // after `self`; `bitmap_len` is validated from `self.bitmap_size_bytes`;
-        // caller guarantees
-        // writable backing memory and unique mutable access for the returned slice.
-        unsafe { core::slice::from_raw_parts_mut(bitmap_ptr_mut, bitmap_len) }
+        // caller guarantees writable backing memory and unique mutable access.
+        Ok(unsafe { core::slice::from_raw_parts_mut(bitmap_ptr_mut, bitmap_len) })
     }
 
     /// Processes `start..end` by eagerly accepting required parts and deferring the rest in bitmap.
@@ -322,6 +512,9 @@ impl EfiUnacceptedMemory {
         Ok(())
     }
 
+    /// Returns the total physical address range (in bytes) covered by the bitmap.
+    ///
+    /// Returns `None` if the computation overflows.
     pub fn total_coverage_size(&self) -> Option<u64> {
         let unit_size = u64::from(self.unit_size_bytes);
         self.bitmap_size_bytes
@@ -355,12 +548,12 @@ impl EfiUnacceptedMemory {
         let (first_bit, last_bit) = self.addr_to_bit_range(range_start, range_end, unit_size)?;
         let phys_base = PhysAddr::new(self.phys_base);
 
-        let bit_to_gpa = |bit: BitIndex| -> Result<u64, AcceptError> {
+        let bit_to_gpa_fn = |bit: BitIndex| -> Result<u64, AcceptError> {
             Ok(phys_base.checked_add_units(bit, unit_size)?.raw())
         };
 
         // SAFETY: Caller guarantees table/bitmap validity and exclusive mutable access.
-        let mut bitmap = BitmapMut::new(unsafe { self.as_bitmap_slice_mut() });
+        let mut bitmap = BitmapMut::new(unsafe { self.as_bitmap_slice_mut()? });
         let mut accepted_units = 0u64;
 
         let mut scan = first_bit;
@@ -369,8 +562,8 @@ impl EfiUnacceptedMemory {
                 .find_next_zero(run_start, last_bit)?
                 .unwrap_or(last_bit);
 
-            let run_gpa_start = bit_to_gpa(run_start)?;
-            let run_gpa_end = bit_to_gpa(run_end)?;
+            let run_gpa_start = bit_to_gpa_fn(run_start)?;
+            let run_gpa_end = bit_to_gpa_fn(run_end)?;
 
             // SAFETY: Caller guarantees bitmap/GPA mapping validity for pending private pages.
             unsafe { accept_memory(run_gpa_start, run_gpa_end)? };
@@ -387,28 +580,6 @@ impl EfiUnacceptedMemory {
             0 => Ok(AcceptOutcome::AlreadyAccepted),
             n => Ok(AcceptOutcome::AcceptedNow { accepted_units: n }),
         }
-    }
-
-    /// Marks `start..end` (bitmap-relative) as unaccepted bits.
-    ///
-    /// # Safety
-    ///
-    /// The caller must ensure `start..end` is already converted to bitmap-relative offsets
-    /// (i.e., based on `self.phys_base`) and does not violate bitmap ownership/aliasing rules.
-    unsafe fn set_unaccepted_bits(&mut self, start: u64, end: u64) -> Result<(), AcceptError> {
-        let unit_size = self.validated_unit_size()?;
-
-        let abs_start = self
-            .phys_base
-            .checked_add(start)
-            .ok_or(AcceptError::ArithmeticOverflow)?;
-        let abs_end = self
-            .phys_base
-            .checked_add(end)
-            .ok_or(AcceptError::ArithmeticOverflow)?;
-
-        // SAFETY: Caller guarantees bitmap-relative range correctness and exclusive access.
-        unsafe { self.mark_range_as_unaccepted(abs_start, abs_end, unit_size) }
     }
 
     fn total_bits(&self) -> Result<u64, AcceptError> {
@@ -503,8 +674,9 @@ impl EfiUnacceptedMemory {
             return Ok(());
         }
 
-        debug_assert_eq!(start % unit_size, 0);
-        debug_assert_eq!(end % unit_size, 0);
+        if start % unit_size != 0 || end % unit_size != 0 {
+            return Err(AcceptError::InvalidAlignment);
+        }
 
         let start_bit = BitIndex::new((start - self.phys_base) / unit_size);
         let end_bit = BitIndex::new((end - self.phys_base) / unit_size);
@@ -517,7 +689,7 @@ impl EfiUnacceptedMemory {
         }
 
         // SAFETY: Caller guarantees bitmap memory is writable and uniquely accessible.
-        let mut bitmap = BitmapMut::new(unsafe { self.as_bitmap_slice_mut() });
+        let mut bitmap = BitmapMut::new(unsafe { self.as_bitmap_slice_mut()? });
         for bit in clamped_start_bit.raw()..clamped_end_bit.raw() {
             bitmap.set_bit(BitIndex::new(bit))?;
         }
@@ -539,256 +711,24 @@ impl EfiUnacceptedMemory {
         // SAFETY: Caller guarantees the physical range is valid for TDX acceptance.
         unsafe { accept_memory(start, end) }
     }
-}
 
-/// Mutable bitmap view used by registration/acceptance paths.
-///
-/// This helper is intentionally non-atomic; callers must provide external
-/// synchronization when multiple CPUs could touch the same bitmap.
-struct BitmapMut<'a> {
-    bits: &'a mut [u8],
-}
-
-impl<'a> BitmapMut<'a> {
-    fn new(bits: &'a mut [u8]) -> Self {
-        Self { bits }
-    }
-
-    fn capacity(&self) -> Result<u64, AcceptError> {
-        let len = u64::try_from(self.bits.len()).map_err(|_| AcceptError::OutOfBounds)?;
-        len.checked_mul(8).ok_or(AcceptError::ArithmeticOverflow)
-    }
-
-    fn get_pos_mask(&self, bit_index: BitIndex) -> Result<(usize, u8), AcceptError> {
-        if bit_index.raw() >= self.capacity()? {
-            return Err(AcceptError::OutOfBounds);
-        }
-
-        let byte_index =
-            usize::try_from(bit_index.raw() >> 3).map_err(|_| AcceptError::OutOfBounds)?;
-        let mask = 1u8 << (bit_index.raw() & 7);
-        Ok((byte_index, mask))
-    }
-
-    fn is_set(&self, bit_index: BitIndex) -> Result<bool, AcceptError> {
-        let (byte_index, mask) = self.get_pos_mask(bit_index)?;
-        Ok((self.bits[byte_index] & mask) != 0)
-    }
-
-    fn set_bit(&mut self, bit_index: BitIndex) -> Result<(), AcceptError> {
-        if self.is_set(bit_index)? {
-            return Err(AcceptError::Overlap);
-        }
-        let (byte_index, mask) = self.get_pos_mask(bit_index)?;
-        self.bits[byte_index] |= mask;
-        Ok(())
-    }
-
-    fn clear_bit(&mut self, bit_index: BitIndex) -> Result<(), AcceptError> {
-        let (byte_index, mask) = self.get_pos_mask(bit_index)?;
-        self.bits[byte_index] &= !mask;
-        Ok(())
-    }
-
-    fn clear_range(&mut self, start_bit: BitIndex, end_bit: BitIndex) -> Result<(), AcceptError> {
-        let bit_len = self.capacity()?;
-        if start_bit.raw() > end_bit.raw() || end_bit.raw() > bit_len {
-            return Err(AcceptError::OutOfBounds);
-        }
-        if start_bit == end_bit {
-            return Ok(());
-        }
-
-        let start_byte =
-            usize::try_from(start_bit.raw() >> 3).map_err(|_| AcceptError::OutOfBounds)?;
-        let end_exclusive_byte =
-            usize::try_from((end_bit.raw() + 7) >> 3).map_err(|_| AcceptError::OutOfBounds)?;
-        let start_off = u8::try_from(start_bit.raw() & 7).map_err(|_| AcceptError::OutOfBounds)?;
-        let end_off = u8::try_from(end_bit.raw() & 7).map_err(|_| AcceptError::OutOfBounds)?;
-
-        if start_byte + 1 == end_exclusive_byte {
-            // Entire range is inside one byte.
-            let end_off_eff = if end_off == 0 { 8 } else { end_off };
-            let clear_mask = bit_range_mask(start_off, end_off_eff);
-            self.bits[start_byte] &= !clear_mask;
-            return Ok(());
-        }
-
-        // Leading partial byte.
-        if start_off != 0 {
-            self.bits[start_byte] &= low_bits_mask(start_off);
-        } else {
-            self.bits[start_byte] = 0;
-        }
-
-        // Middle full bytes.
-        let middle_start = start_byte + 1;
-        let middle_end = if end_off == 0 {
-            end_exclusive_byte
-        } else {
-            end_exclusive_byte - 1
-        };
-        if middle_start < middle_end {
-            self.bits[middle_start..middle_end].fill(0);
-        }
-
-        // Trailing partial byte.
-        if end_off != 0 {
-            let keep_high = !low_bits_mask(end_off);
-            let last = end_exclusive_byte - 1;
-            self.bits[last] &= keep_high;
-        }
-
-        Ok(())
-    }
-
-    fn find_next_set(
-        &self,
-        start_bit: BitIndex,
-        end_bit: BitIndex,
-    ) -> Result<Option<BitIndex>, AcceptError> {
-        self.find_next_matching(start_bit, end_bit, true)
-    }
-
-    fn find_next_zero(
-        &self,
-        start_bit: BitIndex,
-        end_bit: BitIndex,
-    ) -> Result<Option<BitIndex>, AcceptError> {
-        self.find_next_matching(start_bit, end_bit, false)
-    }
-
-    fn find_next_matching(
-        &self,
-        start_bit: BitIndex,
-        end_bit: BitIndex,
-        target: bool,
-    ) -> Result<Option<BitIndex>, AcceptError> {
-        let bit_len = self.capacity()?;
-        if start_bit.raw() > end_bit.raw() || end_bit.raw() > bit_len {
-            return Err(AcceptError::OutOfBounds);
-        }
-
-        if start_bit == end_bit {
-            return Ok(None);
-        }
-
-        let mut scan_bit = start_bit.raw();
-        let end_bit_raw = end_bit.raw();
-
-        // Scan leading bits until the index is 64-bit aligned.
-        while scan_bit < end_bit_raw && (scan_bit & 63) != 0 {
-            if self.is_set(BitIndex::new(scan_bit))? == target {
-                return Ok(Some(BitIndex::new(scan_bit)));
-            }
-            scan_bit += 1;
-        }
-
-        // Bulk scan by 64-bit words, then use trailing_zeros for first matching bit.
-        while end_bit_raw - scan_bit >= 64 {
-            let next = scan_bit + 64;
-
-            let byte_index =
-                usize::try_from(scan_bit >> 3).map_err(|_| AcceptError::OutOfBounds)?;
-
-            // SAFETY: `next <= end_bit <= bit_len` guarantees we can read exactly 8 bytes here.
-            let word = unsafe {
-                let ptr = self.bits.as_ptr().add(byte_index).cast::<u64>();
-                u64::from_le(ptr.read_unaligned())
-            };
-
-            let match_word = if target { word } else { !word };
-            if match_word != 0 {
-                let delta = u64::from(match_word.trailing_zeros());
-                let found = scan_bit + delta;
-                return Ok(Some(BitIndex::new(found)));
-            }
-
-            scan_bit = next;
-        }
-
-        // Scan remaining tail bits (< 64).
-        while scan_bit < end_bit_raw {
-            if self.is_set(BitIndex::new(scan_bit))? == target {
-                return Ok(Some(BitIndex::new(scan_bit)));
-            }
-            scan_bit += 1;
-        }
-
-        Ok(None)
-    }
-}
-
-struct BitmapRef<'a> {
-    bits: &'a [u8],
-}
-
-impl<'a> BitmapRef<'a> {
-    fn new(bits: &'a [u8]) -> Self {
-        Self { bits }
-    }
-
-    fn has_set_bit(&self, start_bit: BitIndex, end_bit: BitIndex) -> Result<bool, AcceptError> {
-        if start_bit >= end_bit {
-            return Ok(false);
-        }
-
-        let bit_len = self
-            .bits
-            .len()
-            .checked_mul(8)
-            .ok_or(AcceptError::ArithmeticOverflow)?;
-        let start_bit = usize::try_from(start_bit.raw()).map_err(|_| AcceptError::OutOfBounds)?;
-        let end_bit = usize::try_from(end_bit.raw()).map_err(|_| AcceptError::OutOfBounds)?;
-        if end_bit > bit_len {
-            return Err(AcceptError::OutOfBounds);
-        }
-
-        let mut bit = start_bit;
-
-        // Scan head until byte alignment.
-        while bit < end_bit && (bit & 7) != 0 {
-            let byte_idx = bit >> 3;
-            let mask = 1u8 << (bit & 7);
-            if (self.bits[byte_idx] & mask) != 0 {
-                return Ok(true);
-            }
-            bit += 1;
-        }
-
-        let mut byte_idx = bit >> 3;
-        let end_full_byte = end_bit >> 3;
-
-        // Bulk scan by u64 for full bytes.
-        while byte_idx + 8 <= end_full_byte {
-            // SAFETY: loop condition guarantees 8 readable bytes.
-            let word = unsafe {
-                let ptr = self.bits.as_ptr().add(byte_idx).cast::<u64>();
-                u64::from_le(ptr.read_unaligned())
-            };
-            if word != 0 {
-                return Ok(true);
-            }
-            byte_idx += 8;
-        }
-
-        while byte_idx < end_full_byte {
-            if self.bits[byte_idx] != 0 {
-                return Ok(true);
-            }
-            byte_idx += 1;
-        }
-
-        // Check tail bits in one masked-byte test.
-        let tail_bits = (end_bit & 7) as u8;
-        if tail_bits != 0 {
-            let tail_mask = low_bits_mask(tail_bits);
-            if (self.bits[end_full_byte] & tail_mask) != 0 {
-                return Ok(true);
-            }
-        }
-
-        Ok(false)
+    /// Returns the raw mutable pointer and length of the trailing bitmap payload.
+    ///
+    /// This allows concurrent bitmap mutation through raw pointers when the caller
+    /// guarantees that non-overlapping byte ranges are accessed.
+    ///
+    /// # Safety
+    ///
+    /// The caller must ensure:
+    /// - The returned pointer accesses valid, writable memory following this header.
+    /// - Concurrent mutable accesses to overlapping bitmap bytes are prevented
+    ///   (e.g., by holding a shard lock that covers the target byte range).
+    unsafe fn bitmap_raw_parts_mut(&self) -> Result<(*mut u8, usize), AcceptError> {
+        let bitmap_len = self.byte_len()?;
+        let bitmap_ptr = core::ptr::from_ref(self)
+            .cast::<u8>()
+            .add(core::mem::size_of::<Self>()) as *mut u8;
+        Ok((bitmap_ptr, bitmap_len))
     }
 }
 
@@ -818,39 +758,6 @@ impl PhysAddr {
             .ok_or(AcceptError::ArithmeticOverflow)?;
         self.checked_add(bytes)
     }
-}
-
-/// Strongly-typed bitmap index used to avoid mixing bit position with GPA.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-struct BitIndex(u64);
-
-impl BitIndex {
-    const fn new(raw: u64) -> Self {
-        Self(raw)
-    }
-
-    const fn raw(self) -> u64 {
-        self.0
-    }
-}
-
-fn low_bits_mask(count: u8) -> u8 {
-    debug_assert!(count <= 8);
-    if count == 0 {
-        0
-    } else {
-        u8::MAX >> (8 - count)
-    }
-}
-
-fn bit_range_mask(start_off: u8, end_off: u8) -> u8 {
-    debug_assert!(start_off <= end_off && end_off <= 8);
-    if start_off == end_off {
-        return 0;
-    }
-
-    let width = end_off - start_off;
-    low_bits_mask(width) << start_off
 }
 
 fn align_down(addr: u64, align: u64) -> u64 {
