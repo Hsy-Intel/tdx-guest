@@ -45,9 +45,7 @@ pub(crate) fn handle_io(trapframe: &mut dyn TdxTrapFrame, ve_info: &TdgVeInfo) -
             let value = io_read(size, port).unwrap() as usize;
             match size {
                 IoSize::Size1 => trapframe.set_rax((trapframe.rax() & !0xFF) | (value & 0xFF)),
-                IoSize::Size2 => {
-                    trapframe.set_rax((trapframe.rax() & !0xFFFF) | (value & 0xFFFF))
-                }
+                IoSize::Size2 => trapframe.set_rax((trapframe.rax() & !0xFFFF) | (value & 0xFFFF)),
                 IoSize::Size4 => trapframe.set_rax(value & 0xFFFF_FFFF),
                 _ => unreachable!(),
             }
