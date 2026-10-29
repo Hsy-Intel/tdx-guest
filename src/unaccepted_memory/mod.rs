@@ -5,16 +5,14 @@
 //!
 //! This module provides mechanisms to manage and accept
 //! unaccepted memory regions in TDX guests.
-//! The core data structure is [`EfiUnacceptedMemory`],
-//! which represents the EFI table header
-//! and provides methods to manipulate the unaccepted memory bitmap
-//! and perform acceptance operations.
+//! Build an [`EfiUnacceptedMemory`] table with [`EfiUnacceptedMemoryBuilder`],
+//! register it with [`init_acceptance_state`], and use [`ensure_accepted`] before
+//! accessing pending memory. Bitmap access and acceptance synchronization remain
+//! internal to this module.
 
 mod accept;
 mod bitmap;
 mod layout;
-mod parse;
-mod query;
 mod register;
 #[cfg(test)]
 mod tests;
@@ -27,8 +25,7 @@ use core::{
 pub use accept::{
     ensure_accepted, init_acceptance_state, unaccepted_bytes, unaccepted_memory_table,
 };
-pub use bitmap::BitmapRef;
-use layout::{min_max_from_ranges, BitmapLayout};
+use layout::BitmapLayout;
 
 use crate::AcceptError;
 
@@ -53,15 +50,11 @@ impl EfiUnacceptedMemoryBuilder {
     }
 }
 
-/// GUID of the Linux-compatible unaccepted-memory EFI table.
-pub const LINUX_EFI_UNACCEPTED_MEM_TABLE_GUID: uefi_raw::Guid =
-    uefi_raw::guid!("d5d1de3c-105c-44f9-9ea9-bcef98120031");
-
 /// Version of the Linux-compatible unaccepted-memory EFI table supported here.
-pub const LINUX_EFI_UNACCEPTED_MEM_TABLE_VERSION: u32 = 1;
+const LINUX_EFI_UNACCEPTED_MEM_TABLE_VERSION: u32 = 1;
 
 /// Unit size for unaccepted-memory bitmap entries (2 MiB).
-pub const EFI_UNACCEPTED_UNIT_SIZE: u64 = 2 * 1024 * 1024;
+const EFI_UNACCEPTED_UNIT_SIZE: u64 = 2 * 1024 * 1024;
 
 /// Header of the Linux-compatible EFI unaccepted-memory table.
 ///
@@ -109,14 +102,6 @@ pub struct EfiUnacceptedMemory {
 }
 
 impl EfiUnacceptedMemory {
-    /// Returns the allocation size required for a table covering `ranges`.
-    ///
-    /// Returns `Err(AcceptError::OutOfBounds)` when `ranges` is empty or contains an empty range.
-    pub fn required_size(ranges: &[Range<u64>]) -> Result<usize, AcceptError> {
-        let coverage = min_max_from_ranges(ranges)?;
-        Self::required_size_for_range(coverage)
-    }
-
     /// Returns the allocation size required for a table covering `coverage`.
     pub fn required_size_for_range(coverage: Range<u64>) -> Result<usize, AcceptError> {
         let layout = BitmapLayout::from_range(coverage)?;
@@ -135,7 +120,7 @@ impl EfiUnacceptedMemory {
     ///
     /// The caller must ensure that:
     /// - `table_addr` points to a writable allocation of `allocation_size` bytes;
-    /// - `allocation_size` is at least [`Self::required_size_for_range(coverage)`];
+    /// - `allocation_size` is at least the size returned by [`Self::required_size_for_range`];
     /// - the allocation remains valid for the returned `'static` reference;
     /// - no other reference accesses the allocation while the table exists.
     pub unsafe fn builder(
@@ -185,58 +170,9 @@ impl EfiUnacceptedMemory {
         Ok(EfiUnacceptedMemoryBuilder { table })
     }
 
-    /// Initializes a complete table in a caller-provided allocation.
-    ///
-    /// This initializes the header and bitmap, then registers every range before
-    /// returning the table. `ranges` must not be empty.
-    ///
-    /// This operation is not transactional. Registering a range may accept its
-    /// unaligned edges immediately. If a later registration or TDX operation
-    /// fails, some memory may already have been accepted and the allocation may
-    /// contain a partially initialized table; the returned error does not roll
-    /// back those effects.
-    ///
-    /// # Safety
-    ///
-    /// The caller must ensure that:
-    /// - `table_addr` points to a writable allocation of `allocation_size` bytes;
-    /// - the allocation remains valid for the returned `'static` reference;
-    /// - `ranges` is non-empty and its entries are non-empty, mutually
-    ///   non-overlapping, 4-KiB-aligned GPA ranges;
-    /// - every range is valid guest-private memory in the pending state and may
-    ///   be accepted by this function;
-    /// - no other reference accesses the allocation while the returned mutable
-    ///   reference exists.
-    pub unsafe fn new(
-        table_addr: NonNull<u8>,
-        allocation_size: usize,
-        ranges: &[Range<u64>],
-    ) -> Result<Pin<&'static mut Self>, AcceptError> {
-        let coverage = min_max_from_ranges(ranges)?;
-        let mut builder = unsafe { Self::builder(table_addr, allocation_size, coverage)? };
-
-        for range in ranges {
-            // SAFETY: The caller guarantees every input range is valid
-            // guest-private memory in pending/acceptable state.
-            unsafe { builder.register_range(range.start, range.end)? };
-        }
-
-        Ok(builder.build())
-    }
-
-    /// Returns the version of the table header.
-    pub const fn version(&self) -> u32 {
-        self.version
-    }
-
     /// Returns the unit size represented by one bitmap bit, in bytes.
     pub const fn unit_size_bytes(&self) -> u32 {
         self.unit_size_bytes
-    }
-
-    /// Returns the start physical address covered by the bitmap.
-    pub const fn phys_base(&self) -> u64 {
-        self.phys_base
     }
 
     /// Returns the trailing bitmap payload length, in bytes.

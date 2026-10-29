@@ -4,6 +4,31 @@
 
 The tdx-guest provides a Rust implementation of Intel® Trust Domain Extensions (Intel® TDX) Guest APIs, supporting for TDX Guest specific instructions, structures and functions.
 
+## On-demand memory acceptance
+
+Construct an EFI unaccepted-memory table with
+`EfiUnacceptedMemory::required_size_for_range()` and
+`EfiUnacceptedMemory::builder()`, then register its ranges through the builder
+and finish it with `build()`.
+
+Register the completed table once with `init_acceptance_state()`
+before allocating memory that may be unaccepted. Then call
+`unsafe { ensure_accepted(range, disable_local_irq) }` before accessing each
+allocated range. The callback must disable local interrupts and return a guard
+that restores their previous state when dropped.
+
+The library owns bitmap synchronization, shard locking, and acceptance accounting.
+It publishes a unit as accepted only after the hardware operation succeeds.
+`unaccepted_bytes()` reports the remaining pending bytes; it is a statistical
+snapshot, not an acceptance barrier.
+
+Once a table is registered, use `ensure_accepted()` exclusively for its pending
+units. The table exposes layout information, not direct bitmap access.
+With no registered table, `ensure_accepted()` is a no-op; callers must not use
+that case for unaccepted memory. Acceptance
+errors can leave a unit partially accepted by the hardware. This progress is not
+rolled back; the whole unit remains counted as pending until acceptance completes.
+
 ## TDCALL Implementation
 
 | Leaf Num | Name in Specification | Description | Is Implemented | Interface Function Name | TDX version |

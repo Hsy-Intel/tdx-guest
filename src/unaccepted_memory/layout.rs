@@ -17,17 +17,12 @@ use crate::AcceptError;
 impl EfiUnacceptedMemory {
     /// Returns the physical address range covered by the bitmap.
     pub fn coverage_range(&self) -> Range<u64> {
-        let end = self.phys_base + self.coverage_size();
+        let end = self.phys_base + self.total_bits() * u64::from(self.unit_size_bytes);
         self.phys_base..end
     }
 
-    /// Returns the total physical address range size (in bytes) covered by the bitmap.
-    pub fn coverage_size(&self) -> u64 {
-        self.total_bits() * u64::from(self.unit_size_bytes)
-    }
-
     /// Returns an atomic view of the trailing bitmap.
-    pub fn bitmap_ref(&self) -> BitmapRef<'_> {
+    pub(super) fn bitmap_ref(&self) -> BitmapRef<'_> {
         let bitmap_len = self.bitmap_size_bytes as usize;
         let bitmap_ptr = core::ptr::from_ref(self)
             .cast::<u8>()
@@ -99,25 +94,6 @@ impl BitmapLayout {
             size_bytes: usize::try_from(bitmap_size_bytes).map_err(|_| AcceptError::OutOfBounds)?,
         })
     }
-}
-
-pub(super) fn min_max_from_ranges(ranges: &[Range<u64>]) -> Result<Range<u64>, AcceptError> {
-    let first = ranges.first().ok_or(AcceptError::OutOfBounds)?;
-    if first.start >= first.end {
-        return Err(AcceptError::OutOfBounds);
-    }
-
-    let mut min_addr = first.start;
-    let mut max_addr = first.end;
-    for range in &ranges[1..] {
-        if range.start >= range.end {
-            return Err(AcceptError::OutOfBounds);
-        }
-        min_addr = min_addr.min(range.start);
-        max_addr = max_addr.max(range.end);
-    }
-
-    Ok(min_addr..max_addr)
 }
 
 pub(super) fn align_down(addr: u64, align: u64) -> u64 {
