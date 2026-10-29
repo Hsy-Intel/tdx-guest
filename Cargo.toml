@@ -16,3 +16,4 @@ raw-cpuid = "10"
 uefi-raw = "0.14.0"
 iced-x86 = { version = "1.21.0", default-features = false, features = [ "no_std", "decoder", "gas" ] }
 log = "0.4"
+spin = "0.9"

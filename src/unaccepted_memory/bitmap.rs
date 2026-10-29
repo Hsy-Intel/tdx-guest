@@ -12,9 +12,9 @@ pub type BitIndex = u64;
 
 /// Bitmap view backed by a slice of [`AtomicU64`].
 ///
-/// Supports lock-free queries (`has_set_bit`, `find_next_set`, etc.) as well
-/// as atomic range updates (`set_range`, `clear_range`, `clear_all`) via
-/// `AtomicU64`'s relaxed atomic operations.
+/// Supports lock-free queries (`has_set_bit`, `find_next_set`, etc.) with
+/// acquire semantics as well as atomic updates (`set_range`, `clear_bit`,
+/// `clear_range`, `clear_all`).
 #[derive(Clone, Copy)]
 pub struct BitmapRef<'a> {
     bits: &'a [AtomicU64],
@@ -52,6 +52,28 @@ impl<'a> BitmapRef<'a> {
         (self.bits.len() as u64) * 64
     }
 
+    /// Returns `true` if `bit` is within capacity and set (`1`), using acquire ordering.
+    pub fn is_bit_set(&self, bit: BitIndex) -> bool {
+        if bit >= self.capacity() {
+            return false;
+        }
+        let bit = bit as usize;
+        let word_idx = bit / 64;
+        let mask = 1u64 << (bit % 64);
+        self.bits[word_idx].load(Ordering::Acquire) & mask != 0
+    }
+
+    /// Clears `bit` to `0` using release ordering and returns `true` if it was previously set.
+    pub fn clear_bit(&self, bit: BitIndex) -> bool {
+        if bit >= self.capacity() {
+            return false;
+        }
+        let bit = bit as usize;
+        let word_idx = bit / 64;
+        let mask = 1u64 << (bit % 64);
+        self.bits[word_idx].fetch_and(!mask, Ordering::Release) & mask != 0
+    }
+
     /// Returns `true` if any bit in `[start_bit, end_bit)` is set.
     pub fn has_set_bit(&self, start_bit: BitIndex, end_bit: BitIndex) -> bool {
         let total_bits = self.capacity();
@@ -71,7 +93,7 @@ impl<'a> BitmapRef<'a> {
             let lo = start.saturating_sub(word_bit_start);
             let hi = end.min(word_bit_start + 64) - word_bit_start;
             let mask = word_range_mask(lo, hi);
-            if self.bits[word_idx].load(Ordering::Relaxed) & mask != 0 {
+            if self.bits[word_idx].load(Ordering::Acquire) & mask != 0 {
                 return true;
             }
         }
@@ -83,14 +105,14 @@ impl<'a> BitmapRef<'a> {
     pub fn pending_unit_count(&self) -> u64 {
         self.bits
             .iter()
-            .map(|word| word.load(Ordering::Relaxed).count_ones() as u64)
+            .map(|word| word.load(Ordering::Acquire).count_ones() as u64)
             .sum()
     }
 
     /// Clears all bits in the bitmap.
     pub fn clear_all(&self) {
         for word in self.bits {
-            word.store(0, Ordering::Relaxed);
+            word.store(0, Ordering::Release);
         }
     }
 
@@ -138,7 +160,7 @@ impl<'a> BitmapRef<'a> {
             let hi = end.min(word_bit_start + 64) - word_bit_start;
             let mask = word_range_mask(lo, hi);
 
-            let word = self.bits[word_idx].load(Ordering::Relaxed);
+            let word = self.bits[word_idx].load(Ordering::Acquire);
             let match_bits = (if target { word } else { !word }) & mask;
             if match_bits != 0 {
                 let delta = match_bits.trailing_zeros() as usize;
@@ -170,9 +192,9 @@ impl<'a> BitmapRef<'a> {
             let mask = word_range_mask(lo, hi);
 
             if set_bits {
-                self.bits[word_idx].fetch_or(mask, Ordering::Relaxed);
+                self.bits[word_idx].fetch_or(mask, Ordering::Release);
             } else {
-                self.bits[word_idx].fetch_and(!mask, Ordering::Relaxed);
+                self.bits[word_idx].fetch_and(!mask, Ordering::Release);
             }
         }
     }

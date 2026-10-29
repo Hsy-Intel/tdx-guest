@@ -4,6 +4,8 @@
 use alloc::vec;
 use core::{mem::size_of, ptr::NonNull, sync::atomic::AtomicU64};
 
+#[cfg(test)]
+use super::accept::AcceptanceState;
 use super::*;
 use crate::AcceptError;
 
@@ -171,4 +173,79 @@ fn test_bitmap_word_boundaries() {
     assert_eq!(bitmap.find_next_set(0, 256), Some(60));
     assert_eq!(bitmap.find_next_set(62, 256), Some(68));
     assert_eq!(bitmap.find_next_set(70, 256), None);
+
+    assert!(bitmap.is_bit_set(60));
+    assert!(bitmap.clear_bit(60));
+    assert!(!bitmap.is_bit_set(60));
+    assert!(!bitmap.clear_bit(60));
+}
+
+#[test]
+fn test_acceptance_state_ensure_accepted() {
+    use alloc::boxed::Box;
+    use core::cell::Cell;
+
+    let coverage = 0x200_000..0xa00_000;
+    let required_size = EfiUnacceptedMemory::required_size_for_range(coverage.clone()).unwrap();
+    let aligned_words = required_size.div_ceil(8);
+    let leaked_words: &'static mut [u64] = Box::leak(vec![0u64; aligned_words].into_boxed_slice());
+    let table_addr = NonNull::new(leaked_words.as_mut_ptr().cast::<u8>()).unwrap();
+
+    let mut builder =
+        unsafe { EfiUnacceptedMemory::builder(table_addr, required_size, coverage).unwrap() };
+    unsafe {
+        builder.register_range(0x200_000, 0x800_000).unwrap();
+    }
+    let table: &'static EfiUnacceptedMemory = builder.build().into_ref().get_ref();
+
+    let state = AcceptanceState::new(table);
+    assert_eq!(
+        state.unaccepted_bytes(),
+        3 * EFI_UNACCEPTED_UNIT_SIZE as usize
+    );
+
+    let irq_disables = Cell::new(0usize);
+    let irq_drops = Cell::new(0usize);
+    struct TestGuard<'a>(&'a Cell<usize>);
+    impl Drop for TestGuard<'_> {
+        fn drop(&mut self) {
+            self.0.set(self.0.get() + 1);
+        }
+    }
+
+    let mut accepted_units = vec![];
+    state
+        .ensure_accepted_with(
+            0x201_000..0x5ff_000,
+            || {
+                irq_disables.set(irq_disables.get() + 1);
+                TestGuard(&irq_drops)
+            },
+            |start, end| {
+                accepted_units.push(start..end);
+                Ok(())
+            },
+        )
+        .unwrap();
+
+    assert_eq!(
+        accepted_units,
+        vec![0x200_000..0x400_000, 0x400_000..0x600_000]
+    );
+    assert_eq!(irq_disables.get(), 2);
+    assert_eq!(irq_drops.get(), 2);
+    assert_eq!(state.unaccepted_bytes(), EFI_UNACCEPTED_UNIT_SIZE as usize);
+
+    // Re-running on an already accepted subrange hits the lock-free fast path.
+    state
+        .ensure_accepted_with(
+            0x200_000..0x600_000,
+            || {
+                irq_disables.set(irq_disables.get() + 1);
+                TestGuard(&irq_drops)
+            },
+            |_, _| panic!("should not re-accept"),
+        )
+        .unwrap();
+    assert_eq!(irq_disables.get(), 2);
 }

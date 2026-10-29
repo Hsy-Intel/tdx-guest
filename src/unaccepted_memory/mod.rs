@@ -24,6 +24,9 @@ use core::{
     sync::atomic::AtomicU64,
 };
 
+pub use accept::{
+    ensure_accepted, init_acceptance_state, unaccepted_bytes, unaccepted_memory_table,
+};
 pub use bitmap::BitmapRef;
 use layout::{min_max_from_ranges, BitmapLayout};
 
