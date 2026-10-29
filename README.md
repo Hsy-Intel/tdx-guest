@@ -4,31 +4,6 @@
 
 The tdx-guest provides a Rust implementation of Intel® Trust Domain Extensions (Intel® TDX) Guest APIs, supporting for TDX Guest specific instructions, structures and functions.
 
-## On-demand memory acceptance
-
-Construct an EFI unaccepted-memory table with
-`EfiUnacceptedMemory::required_size_for_range()` and
-`EfiUnacceptedMemory::builder()`, then register its ranges through the builder
-and finish it with `build()`.
-
-Register the completed table once with `init_acceptance_state()`
-before allocating memory that may be unaccepted. Then call
-`unsafe { ensure_accepted(range, disable_local_irq) }` before accessing each
-allocated range. The callback must disable local interrupts and return a guard
-that restores their previous state when dropped.
-
-The library owns bitmap synchronization, shard locking, and acceptance accounting.
-It publishes a unit as accepted only after the hardware operation succeeds.
-`unaccepted_bytes()` reports the remaining pending bytes; it is a statistical
-snapshot, not an acceptance barrier.
-
-Once a table is registered, use `ensure_accepted()` exclusively for its pending
-units. The table exposes layout information, not direct bitmap access.
-With no registered table, `ensure_accepted()` is a no-op; callers must not use
-that case for unaccepted memory. Acceptance
-errors can leave a unit partially accepted by the hardware. This progress is not
-rolled back; the whole unit remains counted as pending until acceptance completes.
-
 ## TDCALL Implementation
 
 | Leaf Num | Name in Specification | Description | Is Implemented | Interface Function Name | TDX version |
@@ -87,3 +62,15 @@ rolled back; the whole unit remains counted as pending until acceptance complete
 | 48                            | #VE.RequestMMIO                    | ✅             | `read_mmio`, `write_mmio`         | 1.0, 1.5    |
 | 54                            | Instruction.WBINVD                 | ✅             | `perform_cache_operation`         | 1.0, 1.5    |
 | 65                            | Instruction.PCONFIG                | ✅             | `pconfig`                                 | 1.0, 1.5    |
+
+## On-demand memory acceptance
+
+The library also supports on-demand acceptance of guest-private memory.
+After registering an unaccepted-memory table, callers use `ensure_accepted()`
+before accessing allocated memory and supply a callback that disables local
+interrupts and returns a guard that restores their previous state when dropped.
+The library handles synchronization and pending-byte accounting.
+
+See the [`unaccepted_memory` module](src/unaccepted_memory/mod.rs) for table
+construction and the [acceptance API documentation](src/unaccepted_memory/accept.rs)
+for initialization, safety requirements, and error semantics.
