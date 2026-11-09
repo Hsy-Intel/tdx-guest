@@ -67,3 +67,43 @@ td_call_exit:
         pop r15
         pop rbp
         ret
+
+.global asm_td_call_saved
+asm_td_call_saved:
+        endbr64
+        push rbp
+        mov rbp, rsp
+        push r15
+        push r14
+        push r13
+        push r12
+        push rbx
+
+        # The saved-leaf calling convention takes leaf, RCX and RDX as arguments.
+        mov rax, rdi
+        mov rcx, rsi
+
+        # Match the C saved helper: all other saved operands must be zero.
+        xor r8d, r8d
+        xor r9d, r9d
+        xor r10d, r10d
+        xor r11d, r11d
+        xor r12d, r12d
+        xor r13d, r13d
+        xor r14d, r14d
+        xor r15d, r15d
+        xor ebx, ebx
+        xor edi, edi
+        xor esi, esi
+
+        # tdcall
+        .byte 0x66,0x0f,0x01,0xcc
+
+        # Pop out saved registers from stack
+        pop rbx
+        pop r12
+        pop r13
+        pop r14
+        pop r15
+        pop rbp
+        ret

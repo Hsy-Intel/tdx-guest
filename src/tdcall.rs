@@ -10,7 +10,7 @@ use core::fmt;
 
 use bitflags::bitflags;
 
-use crate::{asm::asm_td_call, TdAttributes};
+use crate::{asm::asm_td_call, asm::asm_td_call_saved, TdAttributes};
 
 #[derive(Debug, PartialEq)]
 pub enum TdCallError {
@@ -78,6 +78,36 @@ pub struct TdgVpInfo {
     pub vcpu_index: u32,
     /// Indicates that the TDG.SYS.RD/RDM/RDCALL function are available.
     pub sys_rd: u32,
+}
+
+/// A field that can be read from a bound TDI with TDG.TDI.RD.
+#[derive(Clone, Copy)]
+pub enum TdiReadField {
+    TdispVersion,
+    TdispState,
+    TdispReportHash { out_buf_gpa: u64 },
+    DeviceAttestationInfoHash { out_buf_gpa: u64 },
+    BindSessionId,
+}
+
+impl TdiReadField {
+    fn operands(self) -> (u64, u64) {
+        match self {
+            Self::TdispVersion => (0x01, 0),
+            Self::TdispState => (0x02, 0),
+            Self::TdispReportHash { out_buf_gpa } => (0x03, out_buf_gpa),
+            Self::DeviceAttestationInfoHash { out_buf_gpa } => (0x04, out_buf_gpa),
+            Self::BindSessionId => (0x05, 0),
+        }
+    }
+}
+
+bitflags! {
+    /// Flags accepted by TDG.TDI.START.
+    pub struct TdiStartFlags: u64 {
+        /// Disable the completion timeout.
+        const COMPLETION_TIMEOUT_DISABLED = 1;
+    }
 }
 
 #[repr(C)]
@@ -166,6 +196,74 @@ pub fn get_veinfo() -> Result<TdgVeInfo, TdCallError> {
         exit_instruction_length: args.r10 as u32,
         exit_instruction_info: (args.r10 >> 32) as u32,
     })
+}
+
+/// Read a TDI field using TDG.TDI.RD.
+///
+/// For hash fields, the 48-byte SHA-384 hash is written to the supplied private
+/// page GPA and the return value is the number of bytes written.
+/// Reading `BindSessionId` changes the TDI state from BOUND to ASSIGNED.
+pub fn tdi_rd(gfunction_id: u64, field: TdiReadField) -> Result<u64, TdCallError> {
+    let (field_code, out_buf_gpa) = field.operands();
+    let mut args = TdcallArgs {
+        rax: TdcallNum::TdiRd as u64,
+        rcx: gfunction_id,
+        rdx: field_code,
+        r8: out_buf_gpa,
+        ..Default::default()
+    };
+    td_call(&mut args).map(|_| args.rcx)
+}
+
+/// Authorize the VMM to start a TDI with TDG.TDI.START.
+pub fn tdi_start(
+    gfunction_id: u64,
+    expected_bind_session_id: u64,
+    flags: TdiStartFlags,
+) -> Result<(), TdCallError> {
+    let mut args = TdcallArgs {
+        rax: TdcallNum::TdiStart as u64,
+        rcx: gfunction_id,
+        rdx: expected_bind_session_id,
+        r8: flags.bits(),
+        ..Default::default()
+    };
+    td_call(&mut args)
+}
+
+/// Enable DMA for a TDI with TDG.DMAR.ACCEPT.
+///
+/// `gpasid` is passed as-is in RDX to match the guest C implementation. The ABI
+/// reference describes this operand as a target VM index, so callers must use
+/// the value expected by their deployed TDX module version.
+pub fn dmar_accept(gfunction_id: u64, gpasid: u64) -> Result<(), TdCallError> {
+    td_call_saved(TdcallNum::DmarAccept as u64, gfunction_id, gpasid)
+}
+
+/// Accept a TDI MMIO range with TDG.TDI.MMIO.ACCEPT.
+///
+/// `range_size` and `range_offset` are measured in pages. The low 32 bits of
+/// the R9 operand contain `range_size`; the high 32 bits contain `range_offset`.
+pub fn tdi_mmio_accept(
+    gpa_base_and_level: u64,
+    mmio_range_idx: u64,
+    gfunction_id: u64,
+    range_size: u32,
+    range_offset: u32,
+) -> Result<(), TdCallError> {
+    let mut args = TdcallArgs {
+        rax: TdcallNum::TdiMmioAccept as u64,
+        rcx: gpa_base_and_level,
+        rdx: mmio_range_idx,
+        r8: gfunction_id,
+        r9: mmio_range_size_offset(range_size, range_offset),
+        ..Default::default()
+    };
+    td_call(&mut args)
+}
+
+fn mmio_range_size_offset(range_size: u32, range_offset: u32) -> u64 {
+    (u64::from(range_offset) << 32) | u64::from(range_size)
 }
 
 /// Accept a pending private page and initialize it to all-0 using the TD ephemeral private key.
@@ -569,6 +667,15 @@ pub fn invalidate_l2_gla(l2_vm_idx: u64, list: bool, gla: u64) -> Result<u64, Td
 
 fn td_call(args: &mut TdcallArgs) -> Result<(), TdCallError> {
     let result = unsafe { asm_td_call(args) };
+    td_call_result(result)
+}
+
+fn td_call_saved(leaf: u64, rcx: u64, rdx: u64) -> Result<(), TdCallError> {
+    let result = unsafe { asm_td_call_saved(leaf, rcx, rdx) };
+    td_call_result(result)
+}
+
+fn td_call_result(result: u64) -> Result<(), TdCallError> {
     match result {
         0 => Ok(()),
         _ => Err((result >> 32).into()),
@@ -608,6 +715,10 @@ pub enum TdcallNum {
     MrAssignsvns = 28,
     MrKeyGet = 29,
     MemPageRelease = 30,
+    TdiRd = 67,
+    TdiStart = 68,
+    DmarAccept = 70,
+    TdiMmioAccept = 71,
 }
 
 #[repr(C)]
@@ -938,5 +1049,44 @@ impl From<u64> for TdCallError {
             0xE000_0604 => Self::TdxTdFatal,
             _ => Self::Other,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{mmio_range_size_offset, TdcallNum, TdiReadField};
+
+    #[test]
+    fn tdx_connect_leaf_numbers_match_abi() {
+        assert_eq!(TdcallNum::TdiRd as u64, 67);
+        assert_eq!(TdcallNum::TdiStart as u64, 68);
+        assert_eq!(TdcallNum::DmarAccept as u64, 70);
+        assert_eq!(TdcallNum::TdiMmioAccept as u64, 71);
+    }
+
+    #[test]
+    fn tdi_rd_fields_encode_field_code_and_output_gpa() {
+        assert_eq!(TdiReadField::TdispVersion.operands(), (0x01, 0));
+        assert_eq!(TdiReadField::TdispState.operands(), (0x02, 0));
+        assert_eq!(
+            TdiReadField::TdispReportHash {
+                out_buf_gpa: 0x1000
+            }
+            .operands(),
+            (0x03, 0x1000)
+        );
+        assert_eq!(
+            TdiReadField::DeviceAttestationInfoHash {
+                out_buf_gpa: 0x2000
+            }
+            .operands(),
+            (0x04, 0x2000)
+        );
+        assert_eq!(TdiReadField::BindSessionId.operands(), (0x05, 0));
+    }
+
+    #[test]
+    fn mmio_range_size_and_offset_use_expected_r9_bit_fields() {
+        assert_eq!(mmio_range_size_offset(0x1234, 0x5678), 0x5678_0000_1234);
     }
 }

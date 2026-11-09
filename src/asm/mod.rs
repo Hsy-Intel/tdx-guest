@@ -10,5 +10,6 @@ global_asm!(include_str!("tdvmcall.asm"));
 
 extern "C" {
     pub(crate) fn asm_td_call(args: *mut TdcallArgs) -> u64;
+    pub(crate) fn asm_td_call_saved(leaf: u64, rcx: u64, rdx: u64) -> u64;
     pub(crate) fn asm_td_vmcall(args: *mut TdVmcallArgs) -> u64;
 }

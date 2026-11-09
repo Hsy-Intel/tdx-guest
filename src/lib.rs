@@ -23,7 +23,10 @@ use tdcall::{InitError, TdCallError, TdgVpInfo};
 use ve::{handle_io, handle_mmio};
 
 pub use self::{
-    tdcall::{accept_page, get_veinfo, TdgVeInfo, TdxVirtualExceptionType},
+    tdcall::{
+        accept_page, dmar_accept, get_veinfo, tdi_mmio_accept, tdi_rd, tdi_start, TdgVeInfo,
+        TdiReadField, TdiStartFlags, TdxVirtualExceptionType,
+    },
     tdvmcall::{cpuid, hlt, print, rdmsr, wrmsr, TDX_LOGGER},
     unaccepted_memory::{
         ensure_accepted, init_acceptance_state, unaccepted_bytes, unaccepted_memory_table,
